@@ -95,6 +95,7 @@ Bayesian layers
     BayesConv3d
     LPBNNLinear
     LPBNNConv2d
+    BatchNormAdapter2d
 
 
 Density layers
@@ -428,6 +429,7 @@ Post-Processing Methods
     LaplaceApprox
     MCBatchNorm
     DEUP
+    ABNN
 
 
 Scaling Methods

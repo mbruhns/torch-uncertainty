@@ -1,3 +1,5 @@
+# ruff: noqa: F401
+from .abnn import BatchNormAdapter2d
 from .bayes_conv import BayesConv1d, BayesConv2d, BayesConv3d
 from .bayes_linear import BayesLinear
 from .lpbnn import LPBNNConv2d, LPBNNLinear

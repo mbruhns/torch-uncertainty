@@ -1,4 +1,5 @@
 # ruff: noqa: F401
+from .abnn import ABNN
 from .abstract import PostProcessing
 from .calibration import (
     BBQScaler,

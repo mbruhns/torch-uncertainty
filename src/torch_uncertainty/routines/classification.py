@@ -526,7 +526,9 @@ class ClassificationRoutine(LightningModule):
                 pp_probs = pp_out
                 pp_epistemic = None
             else:
-                pp_probs = F.softmax(pp_out, dim=-1)
+                # Average the predictions of post-processing methods returning several estimators
+                pp_out = rearrange(pp_out, "(m b) c -> b m c", b=targets.size(0))
+                pp_probs = F.softmax(pp_out, dim=-1).mean(dim=1)
                 pp_epistemic = None
 
         if self.ood_criterion.input_type == OODCriterionInputType.LOGIT:
