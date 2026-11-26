@@ -87,8 +87,11 @@ class SegmentationRoutine(LightningModule):
             eval_ood: Indicates whether to evaluate the OOD performance. Defaults to ``False``.
             ood_criterion: Criterion for the binary OOD detection task. Defaults to ``"msp"`` which amounts to the
                 maximum softmax probability score (MSP).
-            post_processing: The post-processing technique to use. Defaults to ``None``. Warning: There is no
-                post-processing technique implemented yet for segmentation tasks.
+            post_processing: The post-processing technique to use. It is fitted on the post-processing
+                dataloader at the start of the test and must return logits of shape :math:`(N \times B, C, H, W)`,
+                with :math:`N` its number of estimators. Its predictions are evaluated with the
+                ``test/post/`` metrics and, if :attr:`eval_ood` is ``True``, with the ``ood/post/`` metrics.
+                Defaults to ``None``.
             log_plots: Indicates whether to log figures in the logger. Defaults to ``False``.
             num_samples_to_plot: Number of segmentation prediction and target to plot in the logger. Note that this
                 is only used if :attr:`log_plots` is set to ``True``. Defaults to ``3``.
@@ -218,6 +221,14 @@ class SegmentationRoutine(LightningModule):
             sbsmpl_seg_metrics.clone(prefix="test/"), subsampling_rate=self.metric_subsampling_rate
         )
 
+        if self.post_processing is not None:
+            self.post_seg_metrics = SegmentationMetric(seg_metrics.clone(prefix="test/post/"))
+            self.post_patch_seg_metrics = patch_seg_metrics.clone(prefix="test/post/")
+            self.post_sbsmpl_seg_metrics = SegmentationMetric(
+                sbsmpl_seg_metrics.clone(prefix="test/post/"),
+                subsampling_rate=self.metric_subsampling_rate,
+            )
+
         if self.eval_ood:
             ood_metrics = MetricCollection(
                 {
@@ -227,6 +238,8 @@ class SegmentationRoutine(LightningModule):
                 }
             )
             self.test_ood_metrics = ood_metrics.clone(prefix="ood/")
+            if self.post_processing is not None:
+                self.post_ood_metrics = ood_metrics.clone(prefix="ood/post/")
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
         return self.optim_recipe
@@ -357,6 +370,15 @@ class SegmentationRoutine(LightningModule):
         probs_per_est = logits.softmax(dim=2)
         probs = probs_per_est.mean(dim=1)
 
+        pp_probs: Tensor | None = None
+        pp_probs_per_est: Tensor | None = None
+        if self.post_processing is not None:
+            # Average the predictions of post-processing methods returning several estimators
+            pp_logits = self.post_processing(img)
+            pp_logits = rearrange(pp_logits, "(m b) c h w -> b m c h w", b=targets.size(0))
+            pp_probs_per_est = pp_logits.softmax(dim=2)
+            pp_probs = pp_probs_per_est.mean(dim=1)
+
         if self.log_plots and len(self.sample_buffer) < self.num_samples_to_plot:
             max_count = self.num_samples_to_plot - len(self.sample_buffer)
             for i, (_img, _prb, _tgt) in enumerate(zip(img, probs, targets, strict=True)):
@@ -375,25 +397,49 @@ class SegmentationRoutine(LightningModule):
             self.test_sbsmpl_seg_metrics.update(
                 probs, targets, ignore_mask=(ignore_mask | ood_mask)
             )
-
-        if self.eval_ood and dataloader_idx == 1:
-            if self.ood_criterion.input_type == OODCriterionInputType.PROB:
-                flat_probs = rearrange(probs, "b c h w -> (b h w) c")
-                ood_scores = self.ood_criterion(flat_probs).reshape_as(targets)
-            elif self.ood_criterion.input_type == OODCriterionInputType.ESTIMATOR_PROB:
-                flat_probs_per_est = rearrange(probs_per_est, "b m c h w -> (b h w) m c")
-                ood_scores = self.ood_criterion(flat_probs_per_est).reshape_as(targets)
-            else:
-                raise ValueError(
-                    f"Unsupported input type for OOD criterion: {self.ood_criterion.input_type}"
+            if pp_probs is not None:
+                self.post_seg_metrics.update(
+                    pp_probs, targets, ignore_mask=(ignore_mask | ood_mask)
+                )
+                self.post_patch_seg_metrics.update(
+                    pp_probs, targets, ignore_mask=(ignore_mask | ood_mask)
+                )
+                self.post_sbsmpl_seg_metrics.update(
+                    pp_probs, targets, ignore_mask=(ignore_mask | ood_mask)
                 )
 
+        if self.eval_ood and dataloader_idx == 1:
             labels = torch.zeros_like(targets)
             labels[id_mask] = 0  # ID examples
             labels[ood_mask] = 1  # OOD examples
             labels[ignore_mask] = 255
 
+            ood_scores = self._compute_ood_scores(probs, probs_per_est, targets)
             self.test_ood_metrics.update(ood_scores, labels)
+            if pp_probs is not None and pp_probs_per_est is not None:
+                pp_ood_scores = self._compute_ood_scores(pp_probs, pp_probs_per_est, targets)
+                self.post_ood_metrics.update(pp_ood_scores, labels)
+
+    def _compute_ood_scores(self, probs: Tensor, probs_per_est: Tensor, targets: Tensor) -> Tensor:
+        """Compute the pixel-wise OOD scores with the OOD criterion of the routine.
+
+        Args:
+            probs: the probabilities averaged over the estimators, of shape :math:`(B, C, H, W)`.
+            probs_per_est: the probabilities of each estimator, of shape :math:`(B, M, C, H, W)`.
+            targets: the targets, giving the shape of the scores.
+
+        Returns:
+            Tensor: the OOD scores, with the shape of the targets.
+        """
+        if self.ood_criterion.input_type == OODCriterionInputType.PROB:
+            flat_probs = rearrange(probs, "b c h w -> (b h w) c")
+            return self.ood_criterion(flat_probs).reshape_as(targets)
+        if self.ood_criterion.input_type == OODCriterionInputType.ESTIMATOR_PROB:
+            flat_probs_per_est = rearrange(probs_per_est, "b m c h w -> (b h w) m c")
+            return self.ood_criterion(flat_probs_per_est).reshape_as(targets)
+        raise ValueError(
+            f"Unsupported input type for OOD criterion: {self.ood_criterion.input_type}"
+        )
 
     def on_validation_epoch_end(self) -> None:
         """Compute and log the values of the collected metrics in `validation_step`."""
@@ -414,12 +460,18 @@ class SegmentationRoutine(LightningModule):
         result_dict = self.test_seg_metrics.compute()
         result_dict |= self.test_sbsmpl_seg_metrics.compute()
         result_dict |= self.test_patch_seg_metrics.compute()
+        if self.post_processing is not None:
+            result_dict |= self.post_seg_metrics.compute()
+            result_dict |= self.post_sbsmpl_seg_metrics.compute()
+            result_dict |= self.post_patch_seg_metrics.compute()
         result_dict |= {
             "test/cplx/flops": self.test_num_flops,
             "test/cplx/params": self.num_params,
         }
         if self.eval_ood:
             result_dict |= self.test_ood_metrics.compute()
+            if self.post_processing is not None:
+                result_dict |= self.post_ood_metrics.compute()
 
         self.log_dict(result_dict, logger=True, sync_dist=True)
 
@@ -429,8 +481,14 @@ class SegmentationRoutine(LightningModule):
         self.test_seg_metrics.reset()
         self.test_sbsmpl_seg_metrics.reset()
         self.test_patch_seg_metrics.reset()
+        if self.post_processing is not None:
+            self.post_seg_metrics.reset()
+            self.post_sbsmpl_seg_metrics.reset()
+            self.post_patch_seg_metrics.reset()
         if self.eval_ood:
             self.test_ood_metrics.reset()
+            if self.post_processing is not None:
+                self.post_ood_metrics.reset()
 
         if self.save_to_csv and self.logger is not None:
             log_dir = get_logger_dir(self.logger)
@@ -445,6 +503,12 @@ class SegmentationRoutine(LightningModule):
             "Calibration/Reliability diagram",
             self.test_sbsmpl_seg_metrics.metric["cal/ECE"].plot()[0],
         )
+        if self.post_processing is not None:
+            log_figure(
+                self.logger,
+                "Calibration/Reliability diagram after post-processing",
+                self.post_sbsmpl_seg_metrics.metric["cal/ECE"].plot()[0],
+            )
         log_figure(
             self.logger,
             "Selective Classification/Risk-Coverage curve",

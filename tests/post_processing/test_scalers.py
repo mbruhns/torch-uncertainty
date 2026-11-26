@@ -36,7 +36,9 @@ class TestTemperatureScaler:
         scaler = TemperatureScaler(model=nn.Identity(), init_temperature=2, lr=1, max_iter=10)
         assert scaler.temperature[0] == 2.0
         scaler.fit(dl)
-        assert scaler.temperature[0] > 10  # best is +inf
+        # The optimal inverse temperature is exactly 0: the optimizer stops within rounding error
+        # of it, on either side, so only the magnitude of the temperature is meaningful.
+        assert scaler.temperature[0].abs() > 10  # best is +/-inf
         assert (
             torch.sum(
                 softmax(scaler(torch.as_tensor([[0.6, 0.4]])).detach(), dim=1)

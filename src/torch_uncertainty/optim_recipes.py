@@ -23,9 +23,12 @@ def optim_abnn(
     weight_decay: float = 1e-4,
     nesterov: bool = True,
 ) -> dict:
-    """ABNN finetuning recipe."""
+    """ABNN finetuning recipe.
+
+    Only the parameters that require gradients are optimized.
+    """
     optimizer = optim.SGD(
-        model.parameters(),
+        [param for param in model.parameters() if param.requires_grad],
         lr=lr,
         momentum=momentum,
         weight_decay=weight_decay,

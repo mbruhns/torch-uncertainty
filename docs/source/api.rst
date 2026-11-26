@@ -95,7 +95,11 @@ Bayesian layers
     BayesConv3d
     LPBNNLinear
     LPBNNConv2d
+    BatchNormAdapter
+    BatchNormAdapter1d
     BatchNormAdapter2d
+    BatchNormAdapter3d
+    LayerNormAdapter
 
 
 Density layers
